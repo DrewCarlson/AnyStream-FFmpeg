@@ -118,6 +118,11 @@ typedef struct BenchmarkTimeStamps {
 
 static BenchmarkTimeStamps get_benchmark_time_stamps(void);
 static int64_t getmaxrss(void);
+static int64_t gettime_relative_minus_pause(void);
+static void pause_transcoding(void);
+static void unpause_transcoding(void);
+
+static int64_t nb_frames_dup = 0;
 
 unsigned nb_output_dumped = 0;
 
@@ -132,6 +137,9 @@ int         nb_output_files   = 0;
 
 FilterGraph **filtergraphs;
 int        nb_filtergraphs;
+
+int64_t paused_start = 0;
+int64_t paused_time = 0;
 
 #if HAVE_TERMIOS_H
 
@@ -974,12 +982,29 @@ static void set_tty_echo(int on)
 #endif
 }
 
+
+static void pause_transcoding(void)
+{
+    if (!paused_start)
+        paused_start = av_gettime_relative();
+}
+
+static void unpause_transcoding(void)
+{
+    if (paused_start) {
+        paused_time += av_gettime_relative() - paused_start;
+        paused_start = 0;
+    }
+}
+
 static int check_keyboard_interaction(int64_t cur_time)
 {
     int i, ret, key;
     static int64_t last_time;
-    if (received_nb_signals)
+    if (received_nb_signals) {
+        unpause_transcoding();
         return AVERROR_EXIT;
+    }
     /* read_key() returns 0 on EOF */
     if (cur_time - last_time >= 100000) {
         key =  read_key();
@@ -992,6 +1017,11 @@ static int check_keyboard_interaction(int64_t cur_time)
     }
     if (key == '+') av_log_set_level(av_log_get_level()+10);
     if (key == '-') av_log_set_level(av_log_get_level()-10);
+    if (key == 'u' || key != -1) unpause_transcoding();
+    if (key == 'p') {
+      pause_transcoding();
+      fprintf(stderr, "\nTranscoding paused, press [u] to unpause.\n");
+    }
     if (key == 'c' || key == 'C'){
         char buf[4096], target[64], command[256], arg[256] = {0};
         double time;
@@ -1040,7 +1070,9 @@ static int check_keyboard_interaction(int64_t cur_time)
                         "c      Send command to first matching filter supporting it\n"
                         "C      Send/Queue command to all matching filters\n"
                         "h      dump packets/hex press to cycle through the 3 states\n"
+                        "p      pause transcoding\n"
                         "q      quit\n"
+                        "u      unpause transcoding\n"
                         "s      Show QP histogram\n"
         );
     }
@@ -1145,6 +1177,11 @@ static int transcode_step(OutputStream *ost)
     InputStream  *ist = NULL;
     int ret;
 
+    if (paused_start) {
+      av_usleep(10000);
+      return 0;
+    }
+
     if (ost->filter) {
         if ((ret = fg_transcode_step(ost->filter->graph, &ist)) < 0)
             return ret;
@@ -1190,11 +1227,11 @@ static int transcode(int *err_rate_exceeded)
 
     while (!received_sigterm) {
         OutputStream *ost;
-        int64_t cur_time= av_gettime_relative();
+        int64_t cur_time= gettime_relative_minus_pause();
 
         /* if 'q' pressed, exits */
         if (stdin_interaction)
-            if (check_keyboard_interaction(cur_time) < 0)
+            if (check_keyboard_interaction(av_gettime_relative()) < 0)
                 break;
 
         ret = choose_output(&ost);
@@ -1246,9 +1283,15 @@ static int transcode(int *err_rate_exceeded)
     }
 
     /* dump report by using the first video and audio streams */
-    print_report(1, timer_start, av_gettime_relative());
+    print_report(1, timer_start, gettime_relative_minus_pause());
 
     return ret;
+}
+
+static int64_t gettime_relative_minus_pause(void)
+{
+    return av_gettime_relative() - paused_time -
+            (paused_start ? av_gettime_relative() - paused_start : 0);
 }
 
 static BenchmarkTimeStamps get_benchmark_time_stamps(void)
